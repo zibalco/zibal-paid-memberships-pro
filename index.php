@@ -10,7 +10,13 @@
  */
 //load classes init method
 add_action('plugins_loaded', 'load_zibal_pmpro_class', 11);
-add_action('plugins_loaded', ['PMProGateway_Zibal', 'init'], 12);
+add_action('plugins_loaded', 'init_zibal_pmpro', 12);
+
+function init_zibal_pmpro() {
+    if(class_exists('PMProGateway_Zibal')) {
+        PMProGateway_Zibal::init();
+    }
+}
 
 add_filter('pmpro_currencies', 'zibal_pmpro_add_currency');
 function zibal_pmpro_add_currency($currencies) {
