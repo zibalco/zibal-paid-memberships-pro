@@ -2,10 +2,10 @@
 /**
  * Plugin Name: Zibal Paid Memberships Pro
  * Description: درگاه پرداخت زیبال برای افزونه Paid Memberships Pro
- * Author: Yahya Kangi
- * Version: 1.0
- * Plugin URI: https://docs.zibal.ir/
- * Author URI: http://github.com/YahyaKng
+ * Author: Zibal
+ * Version: 1.2
+ * Plugin URI: https://zibal.ir/
+ * Author URI: http://github.com/zibalco
  * License: GPL v2.0.
  */
 if ( ! defined( 'ABSPATH' ) ) {
@@ -230,8 +230,191 @@ function zibal_pmpro_cancel_order_for_review($morder) {
     zibal_pmpro_cancel_order($morder, 'Zibal payment failed. See Payment Gateway Information.');
 }
 
-function zibal_pmpro_exit_with_customer_payment_error($status_code = 400) {
-    zibal_pmpro_exit_with_message('پرداخت ناموفق بود. لطفاً دوباره تلاش کنید یا با پشتیبانی سایت تماس بگیرید.', $status_code);
+function zibal_pmpro_show_customer_payment_result($morder = null, $status_code = 400) {
+    if (function_exists('status_header')) {
+        status_header(absint($status_code));
+    }
+
+    if (function_exists('nocache_headers')) {
+        nocache_headers();
+    }
+
+    $order_code = !empty($morder->code) ? $morder->code : '';
+    $level_id = !empty($morder->membership_level->id) ? absint($morder->membership_level->id) : 0;
+    $retry_url = $level_id ? pmpro_url('checkout', '?level=' . $level_id) : pmpro_url('levels');
+    $account_url = pmpro_url('account');
+    ?>
+    <!doctype html>
+    <html <?php language_attributes(); ?>>
+    <head>
+        <meta charset="<?php bloginfo('charset'); ?>">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title><?php echo esc_html('پرداخت ناموفق'); ?></title>
+        <?php if (function_exists('wp_head')) { wp_head(); } ?>
+        <style>
+            body.zibal-pmpro-payment-result {
+                margin: 0;
+                min-height: 100vh;
+                background: #f6f7f7;
+                color: #1d2327;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+            .zibal-pmpro-result-wrap {
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 32px 16px;
+                box-sizing: border-box;
+            }
+            .zibal-pmpro-result-card {
+                width: 100%;
+                max-width: 560px;
+                background: #fff;
+                border: 1px solid #dcdcde;
+                border-radius: 10px;
+                box-shadow: 0 12px 32px rgba(0,0,0,.08);
+                overflow: hidden;
+                direction: rtl;
+                text-align: right;
+            }
+            .zibal-pmpro-result-head {
+                padding: 22px 24px;
+                border-bottom: 1px solid #f0f0f1;
+                display: flex;
+                align-items: center;
+                gap: 14px;
+            }
+            .zibal-pmpro-result-icon {
+                width: 44px;
+                height: 44px;
+                border-radius: 50%;
+                background: #fef2f2;
+                color: #b91c1c;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 26px;
+                font-weight: 700;
+                flex: 0 0 auto;
+            }
+            .zibal-pmpro-result-title {
+                margin: 0;
+                font-size: 20px;
+                line-height: 1.5;
+                font-weight: 700;
+            }
+            .zibal-pmpro-result-body {
+                padding: 22px 24px 24px;
+            }
+            .zibal-pmpro-result-message {
+                margin: 0 0 18px;
+                color: #50575e;
+                font-size: 15px;
+                line-height: 1.9;
+            }
+            .zibal-pmpro-result-summary {
+                margin: 0 0 22px;
+                padding: 0;
+                border: 1px solid #e5e7eb;
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            .zibal-pmpro-result-row {
+                display: flex;
+                justify-content: space-between;
+                gap: 16px;
+                padding: 12px 14px;
+                border-bottom: 1px solid #eef0f2;
+                font-size: 14px;
+            }
+            .zibal-pmpro-result-row:last-child {
+                border-bottom: 0;
+            }
+            .zibal-pmpro-result-label {
+                color: #646970;
+            }
+            .zibal-pmpro-result-value {
+                color: #1d2327;
+                font-weight: 600;
+                direction: ltr;
+            }
+            .zibal-pmpro-result-actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            .zibal-pmpro-result-button {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-height: 40px;
+                padding: 0 16px;
+                border-radius: 6px;
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 600;
+                border: 1px solid #2271b1;
+            }
+            .zibal-pmpro-result-button.primary {
+                background: #2271b1;
+                color: #fff;
+            }
+            .zibal-pmpro-result-button.secondary {
+                background: #fff;
+                color: #2271b1;
+            }
+            @media (max-width: 520px) {
+                .zibal-pmpro-result-head,
+                .zibal-pmpro-result-body {
+                    padding-left: 18px;
+                    padding-right: 18px;
+                }
+                .zibal-pmpro-result-actions {
+                    flex-direction: column;
+                }
+                .zibal-pmpro-result-button {
+                    width: 100%;
+                    box-sizing: border-box;
+                }
+            }
+        </style>
+    </head>
+    <body class="zibal-pmpro-payment-result">
+        <main class="zibal-pmpro-result-wrap">
+            <section class="zibal-pmpro-result-card" aria-labelledby="zibal-payment-result-title">
+                <header class="zibal-pmpro-result-head">
+                    <span class="zibal-pmpro-result-icon" aria-hidden="true">!</span>
+                    <h1 id="zibal-payment-result-title" class="zibal-pmpro-result-title"><?php echo esc_html('پرداخت انجام نشد'); ?></h1>
+                </header>
+                <div class="zibal-pmpro-result-body">
+                    <p class="zibal-pmpro-result-message">
+                        <?php echo esc_html('سفارش شما پرداخت موفق دریافت نکرد. اگر مبلغی از حساب شما کم شده باشد، معمولاً طبق روال بانکی برگشت داده می‌شود. برای جزئیات بیشتر می‌توانید با پشتیبانی سایت تماس بگیرید.'); ?>
+                    </p>
+                    <dl class="zibal-pmpro-result-summary">
+                        <?php if ($order_code !== '') : ?>
+                            <div class="zibal-pmpro-result-row">
+                                <dt class="zibal-pmpro-result-label"><?php echo esc_html('شماره سفارش'); ?></dt>
+                                <dd class="zibal-pmpro-result-value"><?php echo esc_html($order_code); ?></dd>
+                            </div>
+                        <?php endif; ?>
+                        <div class="zibal-pmpro-result-row">
+                            <dt class="zibal-pmpro-result-label"><?php echo esc_html('وضعیت'); ?></dt>
+                            <dd class="zibal-pmpro-result-value"><?php echo esc_html('ناموفق / لغو شده'); ?></dd>
+                        </div>
+                    </dl>
+                    <div class="zibal-pmpro-result-actions">
+                        <a class="zibal-pmpro-result-button primary" href="<?php echo esc_url($retry_url); ?>"><?php echo esc_html('تلاش دوباره'); ?></a>
+                        <a class="zibal-pmpro-result-button secondary" href="<?php echo esc_url($account_url); ?>"><?php echo esc_html('رفتن به حساب کاربری'); ?></a>
+                    </div>
+                </div>
+            </section>
+        </main>
+        <?php if (function_exists('wp_footer')) { wp_footer(); } ?>
+    </body>
+    </html>
+    <?php
+    exit;
 }
 
 function zibal_pmpro_render_order_report($order = null) {
@@ -514,7 +697,7 @@ function load_zibal_pmpro_class()
                 } else {
                     zibal_pmpro_cancel_order_for_review($morder);
                     zibal_pmpro_record_order_report($morder, $result, false);
-                    zibal_pmpro_exit_with_customer_payment_error();
+                    zibal_pmpro_show_customer_payment_result($morder);
                 }
             }
 
@@ -548,7 +731,7 @@ function load_zibal_pmpro_class()
                     $callback_response = zibal_pmpro_callback_response_from_request();
                     zibal_pmpro_cancel_order_for_review($morder);
                     zibal_pmpro_record_order_report($morder, $callback_response, false);
-                    zibal_pmpro_exit_with_customer_payment_error();
+                    zibal_pmpro_show_customer_payment_result($morder);
                 }
 
                 if (!empty($morder->payment_transaction_id) && !hash_equals((string) $morder->payment_transaction_id, (string) $trackId)) {
@@ -601,13 +784,13 @@ function load_zibal_pmpro_class()
                     } else {
                         zibal_pmpro_cancel_order_for_review($morder);
                         zibal_pmpro_record_order_report($morder, $result, false);
-                        zibal_pmpro_exit_with_customer_payment_error();
+                        zibal_pmpro_show_customer_payment_result($morder);
                     }
                 } else {
                     $callback_response = zibal_pmpro_callback_response_from_request();
                     zibal_pmpro_cancel_order_for_review($morder);
                     zibal_pmpro_record_order_report($morder, $callback_response, false);
-                    zibal_pmpro_exit_with_customer_payment_error();
+                    zibal_pmpro_show_customer_payment_result($morder);
                 }
             }
 
