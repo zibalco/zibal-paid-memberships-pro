@@ -3,7 +3,8 @@
  * Plugin Name: Zibal Paid Memberships Pro
  * Description: درگاه پرداخت زیبال برای افزونه Paid Memberships Pro
  * Author: Zibal
- * Version: 1.2
+ * Version: 1.7
+ * Requires PHP: 7.4
  * Plugin URI: https://zibal.ir/
  * Author URI: http://github.com/zibalco
  * License: GPL v2.0.
@@ -30,7 +31,7 @@ function zibal_pmpro_add_currency($currencies) {
 	return $currencies;
 }
 
-function post_to_zibal($url, $data = false) {
+function zibal_pmpro_remote_post($url, $data = false) {
     $endpoint = 'https://gateway.zibal.ir/' . ltrim($url, '/');
     $response = wp_remote_post(
         $endpoint,
@@ -46,19 +47,50 @@ function post_to_zibal($url, $data = false) {
     );
 
     if (is_wp_error($response)) {
-        return false;
+        return (object) [
+            'result'  => 'transport_error',
+            'message' => sprintf(
+                'خطا در ارتباط با زیبال: %s',
+                sanitize_text_field($response->get_error_message())
+            ),
+        ];
     }
 
     $status_code = wp_remote_retrieve_response_code($response);
     $body = wp_remote_retrieve_body($response);
 
-    if ($status_code < 200 || $status_code >= 300 || empty($body)) {
-        return false;
+    $decoded = !empty($body) ? json_decode($body) : null;
+
+    if ($status_code < 200 || $status_code >= 300) {
+        if (json_last_error() === JSON_ERROR_NONE && is_object($decoded)) {
+            if (!isset($decoded->message) || !is_scalar($decoded->message) || $decoded->message === '') {
+                $decoded->message = sprintf('زیبال پاسخ HTTP %d برگرداند.', absint($status_code));
+            }
+
+            return $decoded;
+        }
+
+        return (object) [
+            'result'  => 'http_error',
+            'message' => sprintf('زیبال پاسخ HTTP %d برگرداند.', absint($status_code)),
+        ];
     }
 
-    $decoded = json_decode($body);
+    if (empty($body)) {
+        return (object) [
+            'result'  => 'empty_response',
+            'message' => 'پاسخ زیبال خالی بود.',
+        ];
+    }
 
-    return json_last_error() === JSON_ERROR_NONE ? $decoded : false;
+    if (json_last_error() !== JSON_ERROR_NONE || !is_object($decoded)) {
+        return (object) [
+            'result'  => 'invalid_response',
+            'message' => 'پاسخ زیبال قابل خواندن نبود.',
+        ];
+    }
+
+    return $decoded;
 }
 
 function zibal_pmpro_user_agent() {
@@ -66,21 +98,155 @@ function zibal_pmpro_user_agent() {
 
     return sprintf(
         'ZibalPaidMembershipsPro/%s WordPress/%s; %s',
-        '1.0',
+        '1.7',
         isset($wp_version) ? $wp_version : 'unknown',
         home_url()
     );
 }
 
-function zibal_pmpro_expected_amount($morder) {
+function zibal_pmpro_normalize_currency($currency = null) {
     global $pmpro_currency;
 
-    $amount = absint($morder->subtotal);
-    if ($pmpro_currency === 'IRT') {
-        $amount *= 10;
+    if ($currency === null || $currency === '') {
+        $currency = $pmpro_currency;
     }
 
-    return $amount;
+    return strtoupper(trim(sanitize_text_field((string) $currency)));
+}
+
+function zibal_pmpro_validate_currency($currency = null) {
+    $currency = zibal_pmpro_normalize_currency($currency);
+
+    if (!in_array($currency, ['IRR', 'IRT'], true)) {
+        return new WP_Error(
+            'zibal_pmpro_unsupported_currency',
+            'درگاه زیبال فقط واحد پول ریال (IRR) یا تومان (IRT) را می‌پذیرد. واحد پول را در تنظیمات Paid Memberships Pro اصلاح کنید.'
+        );
+    }
+
+    return true;
+}
+
+function zibal_pmpro_expected_amount($morder, $currency = null) {
+    if (!is_object($morder)) {
+        return new WP_Error(
+            'zibal_pmpro_invalid_order',
+            'اطلاعات سفارش برای محاسبه مبلغ پرداخت معتبر نیست.'
+        );
+    }
+
+    $currency = zibal_pmpro_normalize_currency($currency);
+    $currency_validation = zibal_pmpro_validate_currency($currency);
+
+    if (is_wp_error($currency_validation)) {
+        return $currency_validation;
+    }
+
+    if (isset($morder->total) && $morder->total !== '') {
+        $order_total = $morder->total;
+    } else {
+        $subtotal = isset($morder->subtotal) && is_numeric($morder->subtotal) ? (float) $morder->subtotal : 0;
+        $tax = isset($morder->tax) && is_numeric($morder->tax) ? (float) $morder->tax : 0;
+        $order_total = $subtotal + $tax;
+    }
+
+    if (!is_numeric($order_total)) {
+        return new WP_Error(
+            'zibal_pmpro_invalid_amount',
+            'مبلغ نهایی سفارش معتبر نیست.'
+        );
+    }
+
+    $order_total = (float) $order_total;
+
+    if (!is_finite($order_total) || $order_total <= 0) {
+        return new WP_Error(
+            'zibal_pmpro_invalid_amount',
+            'مبلغ نهایی سفارش باید یک عدد صحیح بزرگ‌تر از صفر باشد.'
+        );
+    }
+
+    if (abs($order_total - round($order_total)) > 0.0000001) {
+        return new WP_Error(
+            'zibal_pmpro_decimal_amount',
+            'درگاه زیبال مبلغ اعشاری را نمی‌پذیرد. مبلغ نهایی سطح عضویت، مالیات و تخفیف‌ها باید بدون اعشار تنظیم شوند.'
+        );
+    }
+
+    $currency_multiplier = $currency === 'IRT' ? 10 : 1;
+
+    if ($order_total > floor(PHP_INT_MAX / $currency_multiplier)) {
+        return new WP_Error(
+            'zibal_pmpro_amount_overflow',
+            'مبلغ سفارش از محدوده قابل پردازش خارج است.'
+        );
+    }
+
+    return (int) round($order_total) * $currency_multiplier;
+}
+
+function zibal_pmpro_amount_matches($gateway_amount, $expected_amount) {
+    if (!is_numeric($gateway_amount) || !is_int($expected_amount)) {
+        return false;
+    }
+
+    $gateway_amount = (float) $gateway_amount;
+
+    if (!is_finite($gateway_amount) || abs($gateway_amount - round($gateway_amount)) > 0.0000001) {
+        return false;
+    }
+
+    return (int) round($gateway_amount) === $expected_amount;
+}
+
+/**
+ * Validate that a PMPro level can be paid through Zibal.
+ *
+ * Zibal's request/verify API creates one-time payments and does not return a
+ * subscription identifier that PMPro could renew, synchronize, or cancel.
+ *
+ * @param object|null $level PMPro membership level.
+ * @return true|WP_Error
+ */
+function zibal_pmpro_validate_one_time_level($level) {
+    if (!is_object($level)) {
+        return true;
+    }
+
+    if (function_exists('pmpro_isLevelRecurring')) {
+        $is_recurring = pmpro_isLevelRecurring($level);
+    } else {
+        $billing_amount = isset($level->billing_amount) && is_numeric($level->billing_amount)
+            ? (float) $level->billing_amount
+            : 0;
+        $trial_amount = isset($level->trial_amount) && is_numeric($level->trial_amount)
+            ? (float) $level->trial_amount
+            : 0;
+        $is_recurring = $billing_amount > 0 || $trial_amount > 0;
+    }
+
+    if ($is_recurring) {
+        return new WP_Error(
+            'zibal_pmpro_recurring_not_supported',
+            'درگاه زیبال فقط پرداخت یک‌باره را پشتیبانی می‌کند. برای این سطح، پرداخت دوره‌ای را غیرفعال کنید یا درگاه دیگری انتخاب کنید.'
+        );
+    }
+
+    return true;
+}
+
+/**
+ * Validate the membership level attached to an order.
+ *
+ * @param object $morder PMPro order.
+ * @return true|WP_Error
+ */
+function zibal_pmpro_validate_one_time_order($morder) {
+    $level = is_object($morder) && isset($morder->membership_level)
+        ? $morder->membership_level
+        : null;
+
+    return zibal_pmpro_validate_one_time_level($level);
 }
 
 function zibal_pmpro_get_merchant() {
@@ -102,28 +268,117 @@ function zibal_pmpro_store_pending_order($morder, $track_id, $amount) {
         absint($amount)
     );
     $morder->saveOrder();
+
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_track_id', (string) $track_id);
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_requested_amount', (int) $amount);
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'pending');
 }
 
 function zibal_pmpro_response_to_text($response) {
+    if (is_wp_error($response)) {
+        return sanitize_textarea_field($response->get_error_message());
+    }
+
     if (!$response) {
         return 'پاسخی از زیبال دریافت نشد.';
     }
 
-    if (isset($response->message) && $response->message !== '') {
+    if (isset($response->message) && is_scalar($response->message) && $response->message !== '') {
         return sanitize_textarea_field((string) $response->message);
     }
 
-    return sanitize_textarea_field(wp_json_encode($response, JSON_UNESCAPED_UNICODE));
+    $status_message = zibal_pmpro_response_value($response, ['statusMessage'], '');
+    if ($status_message !== '') {
+        return sanitize_textarea_field($status_message);
+    }
+
+    $status = zibal_pmpro_response_value($response, ['status'], '');
+    if ($status !== '') {
+        return sprintf(
+            '%s (کد وضعیت زیبال: %s)',
+            zibal_pmpro_status_to_text($status),
+            sanitize_text_field((string) $status)
+        );
+    }
+
+    $result_code = zibal_pmpro_response_value($response, ['result', 'status'], 'نامشخص');
+
+    return sanitize_textarea_field(sprintf(
+        '%s (کد نتیجه زیبال: %s)',
+        zibal_pmpro_result_to_text($result_code),
+        $result_code
+    ));
+}
+
+function zibal_pmpro_status_to_text($status) {
+    $messages = [
+        '-2' => 'خطای داخلی زیبال رخ داده است.',
+        '-1' => 'تراکنش در انتظار پرداخت است.',
+        '1'  => 'پرداخت انجام و تراکنش تأیید شده است.',
+        '2'  => 'پرداخت انجام شده و در انتظار تأیید است.',
+        '3'  => 'پرداخت توسط کاربر لغو شد.',
+        '4'  => 'شماره کارت واردشده نامعتبر است.',
+        '5'  => 'موجودی حساب برای پرداخت کافی نیست.',
+        '6'  => 'رمز کارت یا رمز پویای واردشده صحیح نیست.',
+        '7'  => 'تعداد درخواست‌های پرداخت بیش از حد مجاز است.',
+        '8'  => 'تعداد پرداخت اینترنتی روزانه کارت از حد مجاز عبور کرده است.',
+        '9'  => 'مبلغ پرداخت اینترنتی روزانه کارت از حد مجاز عبور کرده است.',
+        '10' => 'صادرکننده کارت نامعتبر است.',
+        '11' => 'خطایی در سوئیچ بانکی رخ داده است.',
+        '12' => 'کارت بانکی قابل دسترسی نیست.',
+        '15' => 'مبلغ تراکنش بازگشت داده شده است.',
+        '16' => 'بازگشت مبلغ تراکنش در حال انجام است.',
+        '18' => 'تراکنش برگشت خورده است.',
+        '21' => 'پذیرنده نامعتبر است.',
+    ];
+
+    $status = (string) $status;
+
+    return isset($messages[$status]) ? $messages[$status] : 'وضعیت اعلام‌شده توسط زیبال ناشناخته است.';
+}
+
+function zibal_pmpro_result_to_text($result) {
+    $messages = [
+        '100' => 'عملیات با موفقیت انجام شد.',
+        '102' => 'پذیرنده زیبال یافت نشد.',
+        '103' => 'پذیرنده زیبال غیرفعال است.',
+        '104' => 'اطلاعات پذیرنده زیبال نامعتبر است.',
+        '105' => 'مبلغ پرداخت کمتر از حد مجاز زیبال است.',
+        '106' => 'آدرس بازگشت پرداخت نامعتبر است.',
+        '113' => 'مبلغ تراکنش از سقف مجاز عبور کرده است.',
+        '115' => 'نشانی IP در پنل زیبال ثبت نشده است.',
+        '201' => 'تراکنش قبلاً تأیید شده است.',
+        '202' => 'سفارش پرداخت نشده یا پرداخت ناموفق بوده است.',
+        '203' => 'شناسه پیگیری زیبال نامعتبر است.',
+        'transport_error' => 'ارتباط شبکه‌ای با زیبال برقرار نشد.',
+        'http_error' => 'زیبال پاسخ HTTP ناموفق برگرداند.',
+        'empty_response' => 'پاسخ زیبال خالی بود.',
+        'invalid_response' => 'پاسخ زیبال قابل خواندن نبود.',
+    ];
+
+    $result = (string) $result;
+
+    return isset($messages[$result]) ? $messages[$result] : 'نتیجه اعلام‌شده توسط زیبال ناشناخته است.';
 }
 
 function zibal_pmpro_response_value($response, $keys, $default = '') {
-    if (!$response) {
+    if (!$response || is_wp_error($response)) {
         return $default;
     }
+
+    $properties = is_object($response) ? get_object_vars($response) : [];
 
     foreach ((array) $keys as $key) {
         if (isset($response->{$key}) && $response->{$key} !== '') {
             return sanitize_text_field((string) $response->{$key});
+        }
+
+        foreach ($properties as $property_key => $property_value) {
+            if (strtolower((string) $property_key) === strtolower((string) $key) && $property_value !== '') {
+                return is_scalar($property_value)
+                    ? sanitize_text_field((string) $property_value)
+                    : $default;
+            }
         }
     }
 
@@ -152,7 +407,9 @@ function zibal_pmpro_update_order_meta($order_id, $key, $value) {
         return;
     }
 
-    if (function_exists('pmpro_update_order_meta')) {
+    if (function_exists('update_pmpro_membership_order_meta')) {
+        update_pmpro_membership_order_meta($order_id, $key, $value);
+    } elseif (function_exists('pmpro_update_order_meta')) {
         pmpro_update_order_meta($order_id, $key, $value);
     } else {
         update_option('zibal_pmpro_order_' . $order_id . '_' . $key, $value, false);
@@ -167,6 +424,10 @@ function zibal_pmpro_get_order_meta($order_id, $key) {
         return '';
     }
 
+    if (function_exists('get_pmpro_membership_order_meta')) {
+        return get_pmpro_membership_order_meta($order_id, $key, true);
+    }
+
     if (function_exists('pmpro_get_order_meta')) {
         return pmpro_get_order_meta($order_id, $key, true);
     }
@@ -175,19 +436,62 @@ function zibal_pmpro_get_order_meta($order_id, $key) {
 }
 
 function zibal_pmpro_record_order_report($morder, $response, $successful) {
-    $track_id = zibal_pmpro_response_value($response, ['trackId', 'refNumber'], (string) $morder->payment_transaction_id);
+    $stored_track_id = zibal_pmpro_get_order_meta($morder->id, 'zibal_track_id');
+    $track_id = zibal_pmpro_response_value(
+        $response,
+        ['trackId'],
+        $stored_track_id !== '' ? (string) $stored_track_id : (string) $morder->payment_transaction_id
+    );
+    $reference_number = zibal_pmpro_response_value($response, ['refNumber'], '-');
     $card_number = zibal_pmpro_response_value($response, ['cardNumber', 'cardNo', 'card'], '-');
+    $payment_time = zibal_pmpro_response_value(
+        $response,
+        ['paidAt', 'paid_at', 'paymentTime', 'payment_time'],
+        current_time('mysql')
+    );
+    $stored_amount = zibal_pmpro_get_stored_requested_amount($morder);
+    $gateway_amount = zibal_pmpro_response_value($response, ['amount'], (string) $stored_amount);
+    $gateway_amount = is_numeric($gateway_amount) ? (int) round((float) $gateway_amount) : $stored_amount;
+    $masked_card = zibal_pmpro_mask_card_number($card_number);
+    $zibal_message = zibal_pmpro_response_to_text($response);
+    $status_code = zibal_pmpro_response_value($response, ['status', 'result'], '-');
     $report = [
-        'transaction_number' => $track_id,
+        'transaction_number' => $reference_number,
+        'track_id' => $track_id,
         'order_date' => isset($morder->timestamp) ? $morder->timestamp : current_time('mysql'),
-        'card_number' => zibal_pmpro_mask_card_number($card_number),
+        'payment_time' => $payment_time,
+        'paid_amount' => $gateway_amount,
+        'card_number' => $masked_card,
         'payment_successful' => $successful ? 'بله' : 'خیر',
-        'zibal_message' => zibal_pmpro_response_to_text($response),
+        'zibal_status_code' => $status_code,
+        'zibal_message' => $zibal_message,
     ];
 
     foreach ($report as $key => $value) {
         zibal_pmpro_update_order_meta($morder->id, 'zibal_' . $key, $value);
     }
+
+    $note_lines = [
+        $successful ? 'وضعیت پرداخت زیبال: موفق' : 'وضعیت پرداخت زیبال: ناموفق / لغوشده',
+        'مبلغ تراکنش در زیبال: ' . number_format($gateway_amount) . ' ریال',
+        'شناسه پیگیری زیبال (trackId): ' . ($track_id !== '' ? $track_id : '-'),
+        'شماره تراکنش بانکی (refNumber): ' . ($reference_number !== '' ? $reference_number : '-'),
+        'شماره کارت: ' . $masked_card,
+        'زمان دقیق رویداد پرداخت: ' . $payment_time,
+        'کد وضعیت/نتیجه زیبال: ' . $status_code,
+        'پیام زیبال: ' . $zibal_message,
+    ];
+
+    $review_note = isset($morder->status) && $morder->status === 'review' && !empty($morder->notes)
+        ? sanitize_textarea_field((string) $morder->notes)
+        : '';
+
+    if ($review_note !== '') {
+        array_unshift($note_lines, 'نیازمند بررسی مدیر: ' . $review_note, '');
+    }
+
+    $morder->notes = sanitize_textarea_field(implode("\n", $note_lines));
+    $morder->saveOrder();
 }
 
 function zibal_pmpro_callback_response_from_request() {
@@ -209,15 +513,101 @@ function zibal_pmpro_callback_response_from_request() {
 }
 
 function zibal_pmpro_get_stored_requested_amount($morder) {
-    if (empty($morder->notes) || !preg_match('/requested amount:\s*(\d+)/', $morder->notes, $matches)) {
+    if (empty($morder->id)) {
         return 0;
     }
 
-    return absint($matches[1]);
+    return absint(zibal_pmpro_get_order_meta($morder->id, 'zibal_requested_amount'));
+}
+
+function zibal_pmpro_callback_token_hash($token) {
+    return hash_hmac('sha256', (string) $token, wp_salt('auth'));
+}
+
+function zibal_pmpro_generate_callback_token() {
+    return wp_generate_password(40, false, false);
+}
+
+function zibal_pmpro_store_request_context($morder, $amount, $merchant, $callback_token, $currency = null) {
+    $currency = zibal_pmpro_normalize_currency($currency);
+
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_requested_amount', (int) $amount);
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_merchant', sanitize_text_field($merchant));
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_currency', $currency);
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_callback_token_hash', zibal_pmpro_callback_token_hash($callback_token));
+    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'requesting');
+}
+
+function zibal_pmpro_get_stored_currency($morder) {
+    if (!is_object($morder) || empty($morder->id)) {
+        return '';
+    }
+
+    return zibal_pmpro_normalize_currency(zibal_pmpro_get_order_meta($morder->id, 'zibal_currency'));
+}
+
+function zibal_pmpro_validate_callback_binding($morder, $track_id, $callback_token) {
+    if (!is_object($morder) || empty($morder->id) || !isset($morder->gateway) || $morder->gateway !== 'zibal') {
+        return new WP_Error('zibal_pmpro_invalid_gateway_order', 'سفارش انتخاب‌شده متعلق به درگاه زیبال نیست.');
+    }
+
+    $stored_track_id = (string) zibal_pmpro_get_order_meta($morder->id, 'zibal_track_id');
+    $stored_token_hash = (string) zibal_pmpro_get_order_meta($morder->id, 'zibal_callback_token_hash');
+    $stored_amount = zibal_pmpro_get_stored_requested_amount($morder);
+
+    if ($stored_track_id === '' || $stored_token_hash === '' || $stored_amount <= 0) {
+        return new WP_Error('zibal_pmpro_missing_payment_context', 'اطلاعات اتصال تراکنش به سفارش کامل نیست و سفارش باید توسط مدیر بررسی شود.');
+    }
+
+    if ($track_id === '' || !hash_equals($stored_track_id, (string) $track_id)) {
+        return new WP_Error('zibal_pmpro_track_id_mismatch', 'شناسه تراکنش با سفارش مطابقت ندارد.');
+    }
+
+    $received_token_hash = zibal_pmpro_callback_token_hash($callback_token);
+    if ($callback_token === '' || !hash_equals($stored_token_hash, $received_token_hash)) {
+        return new WP_Error('zibal_pmpro_callback_token_mismatch', 'شناسه امنیتی بازگشت پرداخت معتبر نیست.');
+    }
+
+    return true;
+}
+
+/**
+ * Acquire an atomic database-backed lock for a payment callback.
+ *
+ * MySQL advisory locks are connection-scoped and are automatically released
+ * if PHP terminates unexpectedly. The site namespace prevents lock collisions
+ * between WordPress installations that share the same database server.
+ *
+ * @return array|false Lock details, or false when the lock is unavailable.
+ */
+function zibal_pmpro_acquire_callback_lock($order_id, $track_id) {
+    global $wpdb;
+
+    if (!is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
+        return false;
+    }
+
+    $database_name = isset($wpdb->dbname) ? (string) $wpdb->dbname : '';
+    $table_prefix = isset($wpdb->prefix) ? (string) $wpdb->prefix : '';
+    $namespace = substr(md5($database_name . '|' . $table_prefix), 0, 12);
+    $lock_name = 'zibal_pmpro_' . $namespace . '_' . substr(md5(absint($order_id) . '|' . (string) $track_id), 0, 32);
+    $got_lock = $wpdb->get_var($wpdb->prepare('SELECT GET_LOCK(%s, 0)', $lock_name));
+
+    return (string) $got_lock === '1' ? ['name' => $lock_name] : false;
+}
+
+function zibal_pmpro_release_callback_lock($lock) {
+    global $wpdb;
+
+    if (!is_array($lock) || empty($lock['name']) || !is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
+        return;
+    }
+
+    $wpdb->get_var($wpdb->prepare('SELECT RELEASE_LOCK(%s)', (string) $lock['name']));
 }
 
 function zibal_pmpro_cancel_order($morder, $message) {
-    $morder->status = 'cancelled';
+    $morder->status = 'error';
     $morder->notes = sanitize_text_field($message);
     $morder->saveOrder();
 }
@@ -226,11 +616,19 @@ function zibal_pmpro_exit_with_message($message, $status_code = 400) {
     wp_die(esc_html($message), esc_html__('Zibal payment error', 'zibal-paid-memberships-pro'), ['response' => absint($status_code)]);
 }
 
-function zibal_pmpro_cancel_order_for_review($morder) {
-    zibal_pmpro_cancel_order($morder, 'Zibal payment failed. See Payment Gateway Information.');
+function zibal_pmpro_cancel_order_for_review($morder, $message = 'پرداخت زیبال نیازمند بررسی دستی مدیر است.') {
+    $existing_notes = !empty($morder->notes) ? sanitize_textarea_field((string) $morder->notes) : '';
+    $morder->status = 'review';
+    $morder->notes = sanitize_text_field($message);
+
+    if ($existing_notes !== '') {
+        $morder->notes .= "\n\n" . $existing_notes;
+    }
+
+    $morder->saveOrder();
 }
 
-function zibal_pmpro_show_customer_payment_result($morder = null, $status_code = 400) {
+function zibal_pmpro_show_customer_payment_result($morder = null, $status_code = 400, $failure_reason = '') {
     if (function_exists('status_header')) {
         status_header(absint($status_code));
     }
@@ -243,6 +641,11 @@ function zibal_pmpro_show_customer_payment_result($morder = null, $status_code =
     $level_id = !empty($morder->membership_level->id) ? absint($morder->membership_level->id) : 0;
     $retry_url = $level_id ? pmpro_url('checkout', '?level=' . $level_id) : pmpro_url('levels');
     $account_url = pmpro_url('account');
+    $failure_reason = sanitize_text_field((string) $failure_reason);
+
+    if ($failure_reason === '') {
+        $failure_reason = 'سفارش شما پرداخت موفق دریافت نکرد. اگر مبلغی از حساب شما کم شده باشد، معمولاً طبق روال بانکی برگشت داده می‌شود. برای جزئیات بیشتر می‌توانید با پشتیبانی سایت تماس بگیرید.';
+    }
     ?>
     <!doctype html>
     <html <?php language_attributes(); ?>>
@@ -389,7 +792,7 @@ function zibal_pmpro_show_customer_payment_result($morder = null, $status_code =
                 </header>
                 <div class="zibal-pmpro-result-body">
                     <p class="zibal-pmpro-result-message">
-                        <?php echo esc_html('سفارش شما پرداخت موفق دریافت نکرد. اگر مبلغی از حساب شما کم شده باشد، معمولاً طبق روال بانکی برگشت داده می‌شود. برای جزئیات بیشتر می‌توانید با پشتیبانی سایت تماس بگیرید.'); ?>
+                        <?php echo esc_html($failure_reason); ?>
                     </p>
                     <dl class="zibal-pmpro-result-summary">
                         <?php if ($order_code !== '') : ?>
@@ -455,10 +858,14 @@ function zibal_pmpro_render_order_report($order = null) {
     $rendered[$order->id] = true;
 
     $report = [
-        'شماره تراکنش' => zibal_pmpro_get_order_meta($order->id, 'zibal_transaction_number'),
+        'شماره تراکنش بانکی (refNumber)' => zibal_pmpro_get_order_meta($order->id, 'zibal_transaction_number'),
+        'شناسه پیگیری زیبال (trackId)' => zibal_pmpro_get_order_meta($order->id, 'zibal_track_id'),
         'تاریخ ثبت سفارش' => zibal_pmpro_get_order_meta($order->id, 'zibal_order_date'),
+        'زمان دقیق رویداد پرداخت' => zibal_pmpro_get_order_meta($order->id, 'zibal_payment_time'),
+        'مبلغ تراکنش در زیبال (ریال)' => zibal_pmpro_get_order_meta($order->id, 'zibal_paid_amount'),
         'شماره کارت' => zibal_pmpro_get_order_meta($order->id, 'zibal_card_number'),
         'پرداخت موفق' => zibal_pmpro_get_order_meta($order->id, 'zibal_payment_successful'),
+        'کد وضعیت/نتیجه زیبال' => zibal_pmpro_get_order_meta($order->id, 'zibal_zibal_status_code'),
         'متن زیبال' => zibal_pmpro_get_order_meta($order->id, 'zibal_zibal_message'),
     ];
 
@@ -520,7 +927,7 @@ function load_zibal_pmpro_class()
                 $gateway = pmpro_getOption('gateway');
 
                 if ($gateway == 'zibal') {
-                    add_filter('pmpro_checkout_before_change_membership_level', ['PMProGateway_Zibal', 'pmpro_checkout_before_change_membership_level'], 10, 2);
+                    add_filter('pmpro_checkout_checks', ['PMProGateway_Zibal', 'pmpro_checkout_checks']);
                     add_filter('pmpro_include_billing_address_fields', '__return_false');
                     add_filter('pmpro_include_payment_information_fields', '__return_false');
                     add_filter('pmpro_required_billing_fields', ['PMProGateway_Zibal', 'pmpro_required_billing_fields']);
@@ -559,6 +966,80 @@ function load_zibal_pmpro_class()
                 ];
 
                 return $options;
+            }
+
+            /**
+             * Zibal is a one-time payment gateway in this integration.
+             *
+             * @since 1.4
+             */
+            public static function supports($feature)
+            {
+                return false;
+            }
+
+            /**
+             * Stop recurring levels before PMPro creates the checkout order.
+             *
+             * @since 1.4
+             */
+            public static function pmpro_checkout_checks($continue)
+            {
+                global $pmpro_level;
+
+                if (!$continue) {
+                    return false;
+                }
+
+                $currency_validation = zibal_pmpro_validate_currency();
+
+                if (is_wp_error($currency_validation)) {
+                    if (function_exists('pmpro_setMessage')) {
+                        pmpro_setMessage($currency_validation->get_error_message(), 'pmpro_error');
+                    }
+
+                    return false;
+                }
+
+                $validation = zibal_pmpro_validate_one_time_level($pmpro_level);
+
+                if (is_wp_error($validation)) {
+                    if (function_exists('pmpro_setMessage')) {
+                        pmpro_setMessage($validation->get_error_message(), 'pmpro_error');
+                    }
+
+                    return false;
+                }
+
+                return true;
+            }
+
+            /**
+             * Never let PMPro's base gateway simulate a Zibal subscription.
+             *
+             * @since 1.4
+             */
+            public function subscribe(&$order)
+            {
+                $order->errorcode = 'zibal_pmpro_recurring_not_supported';
+                $order->error = 'درگاه زیبال از پرداخت دوره‌ای پشتیبانی نمی‌کند.';
+
+                return false;
+            }
+
+            public function update(&$order)
+            {
+                return false;
+            }
+
+            public function cancel(&$order)
+            {
+                return false;
+            }
+
+            public function cancel_subscription($subscription)
+            {
+                return false;
             }
 
             /**
@@ -630,6 +1111,9 @@ function load_zibal_pmpro_class()
                 <td>
                     <input type="text" id="zibal_merchantid" name="zibal_merchantid" size="60" value="<?php echo esc_attr($merchant_id);
                 ?>" />
+                    <p class="description">
+                        <?php echo esc_html('این اتصال زیبال فقط پرداخت یک‌باره را پشتیبانی می‌کند. تسویه‌حساب سطح‌های دارای پرداخت دوره‌ای متوقف می‌شود و هیچ subscription ساختگی در PMPro ثبت نخواهد شد.'); ?>
+                    </p>
                 </td>
                 </tr>
 
@@ -638,56 +1122,95 @@ function load_zibal_pmpro_class()
             }
 
             /**
-             * Instead of change membership levels, send users to Zibal to pay.
+             * Save the asynchronous checkout and send the customer to Zibal.
              *
-             * @since 1.8
+             * @since 1.5
              */
-            public static function pmpro_checkout_before_change_membership_level($user_id, $morder)
+            public function process(&$morder)
             {
-                global $wpdb, $discount_code_id;
+                global $pmpro_currency;
 
                 //if no order, no need to pay
                 if (empty($morder)) {
-                    return;
+                    return false;
                 }
 
-                $morder->user_id = $user_id;
+                if (empty($morder->code) && method_exists($morder, 'getRandomCode')) {
+                    $morder->code = $morder->getRandomCode();
+                }
+
+                $morder->status = 'token';
                 $morder->saveOrder();
 
-                //save discount code use
-                if (!empty($discount_code_id)) {
-                    $wpdb->query(
-                        $wpdb->prepare(
-                            "INSERT INTO {$wpdb->pmpro_discount_codes_uses} (code_id, user_id, order_id, timestamp) VALUES(%d, %d, %d, %s)",
-                            absint($discount_code_id),
-                            absint($user_id),
-                            absint($morder->id),
-                            current_time('mysql')
-                        )
-                    );
+                if (empty($morder->id) || empty($morder->code)) {
+                    $morder->error = 'سفارش پرداخت در Paid Memberships Pro ذخیره نشد. لطفاً دوباره تلاش کنید.';
+                    $morder->errorcode = 'zibal_pmpro_order_not_saved';
+                    return false;
+                }
+
+                $level_validation = zibal_pmpro_validate_one_time_order($morder);
+
+                if (is_wp_error($level_validation)) {
+                    $level_error = (object) [
+                        'message' => $level_validation->get_error_message(),
+                    ];
+                    zibal_pmpro_cancel_order($morder, 'Zibal recurring membership level rejected.');
+                    zibal_pmpro_record_order_report($morder, $level_error, false);
+                    $morder->error = $level_validation->get_error_message();
+                    $morder->errorcode = $level_validation->get_error_code();
+                    return false;
+                }
+
+                $currency = zibal_pmpro_normalize_currency($pmpro_currency);
+                $amount = zibal_pmpro_expected_amount($morder, $currency);
+
+                if (is_wp_error($amount)) {
+                    $amount_error = (object) [
+                        'message' => $amount->get_error_message(),
+                    ];
+                    zibal_pmpro_cancel_order($morder, 'Zibal amount validation failed: ' . $amount->get_error_code());
+                    zibal_pmpro_record_order_report($morder, $amount_error, false);
+                    $morder->error = $amount->get_error_message();
+                    $morder->errorcode = $amount->get_error_code();
+                    return false;
+                }
+
+                if (function_exists('pmpro_save_checkout_data_to_order')) {
+                    pmpro_save_checkout_data_to_order($morder);
                 }
 
                 $order_id = $morder->code;
+                $callback_token = zibal_pmpro_generate_callback_token();
+                $merchant = zibal_pmpro_get_merchant();
+
+                if ($merchant === '') {
+                    zibal_pmpro_cancel_order($morder, 'Zibal merchant is empty in live mode.');
+                    $morder->error = 'کد مرچنت زیبال در تنظیمات پرداخت وارد نشده است.';
+                    $morder->errorcode = 'zibal_pmpro_missing_merchant';
+                    return false;
+                }
+
+                zibal_pmpro_store_request_context($morder, $amount, $merchant, $callback_token, $currency);
+
                 $redirect = add_query_arg(
                     [
                         'action' => 'zibal-ins',
                         'oid'    => $order_id,
+                        'ztoken' => $callback_token,
                     ],
                     admin_url('admin-ajax.php')
                 );
 
-                $amount = zibal_pmpro_expected_amount($morder);
-
                 $data = [
-                    'merchant' => zibal_pmpro_get_merchant(),
+                    'merchant' => $merchant,
                     'amount' => $amount,
                     'orderId' => $order_id,
                     'callbackUrl' => $redirect,
                 ];
                 
-                $result = post_to_zibal('v1/request', $data);
+                $result = zibal_pmpro_remote_post('v1/request', $data);
 
-                if ($result && isset($result->result, $result->trackId) && intval($result->result) === 100) {
+                if ($result && isset($result->result, $result->trackId) && intval($result->result) === 100 && preg_match('/^\d{1,64}$/', (string) $result->trackId)) {
                     $track_id = sanitize_text_field((string) $result->trackId);
                     zibal_pmpro_store_pending_order($morder, $track_id, $amount);
                     $go = 'https://gateway.zibal.ir/start/' . rawurlencode($track_id);
@@ -695,212 +1218,234 @@ function load_zibal_pmpro_class()
                     exit;
 
                 } else {
-                    zibal_pmpro_cancel_order_for_review($morder);
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'error');
+                    zibal_pmpro_cancel_order($morder, 'Zibal payment request failed. See Payment Gateway Information.');
                     zibal_pmpro_record_order_report($morder, $result, false);
-                    zibal_pmpro_show_customer_payment_result($morder);
+                    $morder->error = 'ارتباط با درگاه زیبال برقرار نشد. لطفاً دوباره تلاش کنید.';
+                    $morder->errorcode = 'zibal_pmpro_request_failed';
+                    return false;
                 }
+            }
+
+            /**
+             * Legacy entry point retained for custom code that called this method.
+             */
+            public static function pmpro_checkout_before_change_membership_level($user_id, $morder)
+            {
+                if (empty($morder)) {
+                    return false;
+                }
+
+                $morder->user_id = $user_id;
+                $gateway = new self('zibal');
+                return $gateway->process($morder);
             }
 
             public static function pmpro_wp_ajax_zibal_ins()
             {
-                if (!isset($_GET['oid']) || is_null($_GET['oid'])) {
-                    zibal_pmpro_exit_with_message('meghdare oid dar dargahe zibal elzamist');
+                $oid = isset($_GET['oid']) && is_scalar($_GET['oid']) ? sanitize_text_field(wp_unslash($_GET['oid'])) : '';
+                $track_id = isset($_GET['trackId']) && is_scalar($_GET['trackId']) ? sanitize_text_field(wp_unslash($_GET['trackId'])) : '';
+                $callback_token = isset($_GET['ztoken']) && is_scalar($_GET['ztoken']) ? sanitize_text_field(wp_unslash($_GET['ztoken'])) : '';
+                $status = isset($_GET['status']) && is_scalar($_GET['status'])
+                    ? intval(sanitize_text_field(wp_unslash($_GET['status'])))
+                    : 0;
+
+                if ($oid === '' || !preg_match('/^[A-Za-z0-9]{1,64}$/', $oid)) {
+                    zibal_pmpro_exit_with_message('شماره سفارش بازگشت پرداخت معتبر نیست.');
                 }
 
-                $oid = sanitize_text_field(wp_unslash($_GET['oid']));
-
                 $morder = null;
+
                 try {
                     $morder = new MemberOrder($oid);
                     $morder->getMembershipLevel();
-                    $morder->getUser();
-                } catch (Exception $exception) {
-                    zibal_pmpro_exit_with_message('meghdare oid na motabar ast');
+                } catch (Throwable $exception) {
+                    zibal_pmpro_exit_with_message('شماره سفارش بازگشت پرداخت معتبر نیست.');
                 }
 
-                $current_user_id = get_current_user_id();
-
-                if ($current_user_id !== intval($morder->user_id)) {
-                    zibal_pmpro_exit_with_message('in kharid motealegh be shoma nist', 403);
+                if (empty($morder->id)) {
+                    zibal_pmpro_exit_with_message('سفارش پرداخت پیدا نشد.', 404);
                 }
 
-                $status = isset($_GET['status']) ? absint(wp_unslash($_GET['status'])) : 0;
-                $trackId = isset($_GET['trackId']) ? sanitize_text_field(wp_unslash($_GET['trackId'])) : '';
-
-                if (empty($trackId)) {
-                    $callback_response = zibal_pmpro_callback_response_from_request();
-                    zibal_pmpro_cancel_order_for_review($morder);
-                    zibal_pmpro_record_order_report($morder, $callback_response, false);
-                    zibal_pmpro_show_customer_payment_result($morder);
+                $binding = zibal_pmpro_validate_callback_binding($morder, $track_id, $callback_token);
+                if (is_wp_error($binding)) {
+                    zibal_pmpro_exit_with_message($binding->get_error_message(), 403);
                 }
 
-                if (!empty($morder->payment_transaction_id) && !hash_equals((string) $morder->payment_transaction_id, (string) $trackId)) {
-                    zibal_pmpro_cancel_order($morder, 'Zibal callback trackId mismatch');
-                    zibal_pmpro_exit_with_message('trackId na motabar ast', 403);
-                }
-
-                if ($morder->status === 'success') {
+                if ($morder->status === 'success' && hash_equals((string) $morder->payment_transaction_id, $track_id)) {
                     wp_safe_redirect(pmpro_url("confirmation", "?level=" . absint($morder->membership_level->id)));
                     exit;
                 }
-                 
-                if ($status === 2) {
-                    $amount = zibal_pmpro_expected_amount($morder);
-                    $stored_amount = zibal_pmpro_get_stored_requested_amount($morder);
 
-                    if ($stored_amount > 0 && $stored_amount !== $amount) {
-                        zibal_pmpro_cancel_order($morder, 'Zibal requested amount mismatch');
-                        zibal_pmpro_exit_with_message('meghdare pardakht ba sefaresh motabegh nist', 403);
-                    }
-
-                    $lock_key = 'zibal_pmpro_verify_' . md5($oid . '|' . $trackId);
-
-                    if (get_transient($lock_key)) {
-                        zibal_pmpro_exit_with_message('pardakht dar hale barrasi ast', 409);
-                    }
-
-                    set_transient($lock_key, 1, MINUTE_IN_SECONDS);
-                    
-                    $data = [
-                        'merchant' => zibal_pmpro_get_merchant(),
-                        'trackId' => $trackId,
-                    ];
-                    
-                    $result = post_to_zibal('v1/verify', $data);
-                    delete_transient($lock_key);
-
-                    if ($result && isset($result->result, $result->amount) && intval($result->result) === 100 && absint($result->amount) === $amount) {
-                        zibal_pmpro_record_order_report($morder, $result, true);
-
-                        if (self::do_level_up($morder, $trackId)) {
-                            $go = pmpro_url("confirmation", "?level=" . absint($morder->membership_level->id));
-                            wp_safe_redirect($go);
-                            exit;
-                        }
-
-                        zibal_pmpro_cancel_order($morder, 'Zibal payment verified but membership level change failed');
-                        zibal_pmpro_record_order_report($morder, $result, false);
-                        zibal_pmpro_exit_with_message('taghire sath ozviat ba khata movajeh shod', 500);
-                    } else {
-                        zibal_pmpro_cancel_order_for_review($morder);
-                        zibal_pmpro_record_order_report($morder, $result, false);
-                        zibal_pmpro_show_customer_payment_result($morder);
-                    }
-                } else {
+                if ($status !== 2) {
                     $callback_response = zibal_pmpro_callback_response_from_request();
-                    zibal_pmpro_cancel_order_for_review($morder);
+                    $failure_reason = zibal_pmpro_status_to_text($status);
+                    if (in_array($morder->status, ['token', 'pending'], true)) {
+                        zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'cancelled');
+                        zibal_pmpro_cancel_order($morder, 'Zibal payment was not completed by the customer.');
+                    }
                     zibal_pmpro_record_order_report($morder, $callback_response, false);
-                    zibal_pmpro_show_customer_payment_result($morder);
+                    zibal_pmpro_show_customer_payment_result($morder, 400, $failure_reason);
                 }
+
+                if (!in_array($morder->status, ['token', 'pending'], true)) {
+                    zibal_pmpro_exit_with_message('این سفارش در وضعیت قابل پردازش قرار ندارد.', 409);
+                }
+
+                $lock = zibal_pmpro_acquire_callback_lock($morder->id, $track_id);
+                if ($lock === false) {
+                    $fresh_order = new MemberOrder($oid);
+                    $fresh_order->getMembershipLevel();
+                    if ($fresh_order->status === 'success' && hash_equals((string) $fresh_order->payment_transaction_id, $track_id)) {
+                        wp_safe_redirect(pmpro_url("confirmation", "?level=" . absint($fresh_order->membership_level->id)));
+                        exit;
+                    }
+
+                    zibal_pmpro_exit_with_message('پرداخت در حال بررسی است. چند لحظه دیگر صفحه را تازه کنید.', 409);
+                }
+
+                try {
+                    $outcome = self::process_locked_callback($oid, $track_id, $callback_token);
+                } finally {
+                    zibal_pmpro_release_callback_lock($lock);
+                }
+
+                if ($outcome['action'] === 'redirect') {
+                    wp_safe_redirect($outcome['url']);
+                    exit;
+                }
+
+                if ($outcome['action'] === 'show_failure') {
+                    zibal_pmpro_show_customer_payment_result(
+                        $outcome['order'],
+                        $outcome['status'],
+                        isset($outcome['message']) ? $outcome['message'] : ''
+                    );
+                }
+
+                zibal_pmpro_exit_with_message($outcome['message'], $outcome['status']);
             }
 
-            public static function do_level_up(&$morder, $txn_id)
+            private static function process_locked_callback($oid, $track_id, $callback_token)
             {
-                global $wpdb;
-                //filter for level
-                $morder->membership_level = apply_filters('pmpro_inshandler_level', $morder->membership_level, $morder->user_id);
+                $morder = new MemberOrder($oid);
+                $morder->getMembershipLevel();
 
-                //fix expiration date
-                if (!empty($morder->membership_level->expiration_number)) {
-                    $enddate = "'".date('Y-m-d', strtotime('+ '.$morder->membership_level->expiration_number.' '.$morder->membership_level->expiration_period, current_time('timestamp')))."'";
-                } else {
-                    $enddate = 'NULL';
+                $binding = zibal_pmpro_validate_callback_binding($morder, $track_id, $callback_token);
+                if (is_wp_error($binding)) {
+                    return self::callback_message_outcome($binding->get_error_message(), 403);
                 }
 
-                //get discount code
-                $morder->getDiscountCode();
-                if (!empty($morder->discount_code)) {
-                    //update membership level
-                    $morder->getMembershipLevel(true);
-                    $discount_code_id = $morder->discount_code->id;
-                } else {
-                    $discount_code_id = '';
+                if ($morder->status === 'success' && hash_equals((string) $morder->payment_transaction_id, $track_id)) {
+                    return self::callback_redirect_outcome($morder);
                 }
 
-                //set the start date to current_time('mysql') but allow filters
-                $startdate = apply_filters('pmpro_checkout_start_date', "'".current_time('mysql')."'", $morder->user_id, $morder->membership_level);
-
-                //custom level to change user to
-                $custom_level = [
-                    'user_id'         => $morder->user_id,
-                    'membership_id'   => $morder->membership_level->id,
-                    'code_id'         => $discount_code_id,
-                    'initial_payment' => $morder->membership_level->initial_payment,
-                    'billing_amount'  => $morder->membership_level->billing_amount,
-                    'cycle_number'    => $morder->membership_level->cycle_number,
-                    'cycle_period'    => $morder->membership_level->cycle_period,
-                    'billing_limit'   => $morder->membership_level->billing_limit,
-                    'trial_amount'    => $morder->membership_level->trial_amount,
-                    'trial_limit'     => $morder->membership_level->trial_limit,
-                    'startdate'       => $startdate,
-                    'enddate'         => $enddate, ];
-
-                global $pmpro_error;
-                if (!empty($pmpro_error)) {
-                    echo esc_html($pmpro_error);
-                    if (function_exists('inslog')) {
-                        inslog($pmpro_error);
-                    }
+                if (!in_array($morder->status, ['token', 'pending'], true)) {
+                    return self::callback_message_outcome('این سفارش قبلاً پردازش شده یا در وضعیت قابل پرداخت نیست.', 409);
                 }
-                
-                if (pmpro_changeMembershipLevel($custom_level, $morder->user_id) !== false) {
-                    //update order status and transaction ids
-                    $morder->status = 'success';
-                    $morder->payment_transaction_id = $txn_id;
-                    //if( $recurring )
-                    //    $morder->subscription_transaction_id = $txn_id;
-                    //else
-                    $morder->subscription_transaction_id = '';
-                    $morder->saveOrder();
 
-                    //save first and last name fields
-                    if (!empty($_POST['first_name'])) {
-                        $first_name = sanitize_text_field(wp_unslash($_POST['first_name']));
-                        $old_firstname = get_user_meta($morder->user_id, 'first_name', true);
-                        if (!empty($old_firstname)) {
-                            update_user_meta($morder->user_id, 'first_name', $first_name);
-                        }
-                    }
-                    if (!empty($_POST['last_name'])) {
-                        $last_name = sanitize_text_field(wp_unslash($_POST['last_name']));
-                        $old_lastname = get_user_meta($morder->user_id, 'last_name', true);
-                        if (!empty($old_lastname)) {
-                            update_user_meta($morder->user_id, 'last_name', $last_name);
-                        }
-                    }
-                    
-                    //hook
-                    do_action('pmpro_after_checkout', $morder->user_id, $morder);
+                $stored_currency = zibal_pmpro_get_stored_currency($morder);
+                $amount = zibal_pmpro_expected_amount($morder, $stored_currency);
+                $stored_amount = zibal_pmpro_get_stored_requested_amount($morder);
 
-                    
-                    //setup some values for the emails
-                    if (!empty($morder)) {
-                        $invoice = new MemberOrder($morder->id);
+                if (is_wp_error($amount) || $stored_amount <= 0 || $stored_amount !== $amount) {
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'review');
+                    zibal_pmpro_cancel_order_for_review($morder, 'مبلغ ذخیره‌شده زیبال با مبلغ محاسبه‌شده سفارش مطابقت ندارد.');
+                    return self::callback_message_outcome('مبلغ ذخیره‌شده تراکنش با سفارش مطابقت ندارد و سفارش باید توسط مدیر بررسی شود.', 409);
+                }
+
+                $merchant = sanitize_text_field(zibal_pmpro_get_order_meta($morder->id, 'zibal_merchant'));
+                if ($merchant === '') {
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'review');
+                    zibal_pmpro_cancel_order_for_review($morder, 'اطلاعات مرچنت در سابقه پرداخت زیبال موجود نیست.');
+                    return self::callback_message_outcome('اطلاعات مرچنت این تراکنش کامل نیست و سفارش باید توسط مدیر بررسی شود.', 409);
+                }
+
+                $result = zibal_pmpro_remote_post('v1/verify', [
+                    'merchant' => $merchant,
+                    'trackId' => $track_id,
+                ]);
+
+                if ($result && isset($result->result) && intval($result->result) === 201) {
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'review');
+                    zibal_pmpro_cancel_order_for_review($morder, 'تراکنش در زیبال قبلاً تأیید شده، اما سفارش محلی هنوز موفق نشده است.');
+                    zibal_pmpro_record_order_report($morder, $result, true);
+                    return self::callback_message_outcome('این تراکنش قبلاً در زیبال تأیید شده، اما سفارش محلی کامل نشده است و باید توسط مدیر بررسی شود.', 409);
+                }
+
+                if (!$result || !isset($result->result, $result->amount) || intval($result->result) !== 100 || !zibal_pmpro_amount_matches($result->amount, $stored_amount)) {
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'review');
+                    zibal_pmpro_cancel_order_for_review($morder, 'تأیید تراکنش در زیبال ناموفق بود یا مبلغ پاسخ با سفارش مطابقت نداشت.');
+                    zibal_pmpro_record_order_report($morder, $result, false);
+                    return [
+                        'action' => 'show_failure',
+                        'order' => $morder,
+                        'message' => 'تأیید پرداخت در زیبال ناموفق بود. دلیل دقیق در اطلاعات سفارش ثبت شد.',
+                        'status' => 400,
+                    ];
+                }
+
+                $morder->payment_transaction_id = $track_id;
+                $morder->subscription_transaction_id = '';
+                zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'verified');
+                zibal_pmpro_record_order_report($morder, $result, true);
+
+                try {
+                    if (function_exists('pmpro_pull_checkout_data_from_order') && function_exists('pmpro_complete_async_checkout')) {
+                        pmpro_pull_checkout_data_from_order($morder);
+                        $level_validation = zibal_pmpro_validate_one_time_order($morder);
+                        $completed = !is_wp_error($level_validation) && pmpro_complete_async_checkout($morder);
                     } else {
-                        $invoice = null;
+                        $completed = false;
                     }
-
-                    //inslog("CHANGEMEMBERSHIPLEVEL: ORDER: " . var_export($morder, true) . "\n---\n");
-
-                    $user = get_userdata(intval($morder->user_id));
-                    if (empty($user)) {
-                        return false;
-                    }
-
-                    $user->membership_level = $morder->membership_level;  //make sure they have the right level info
-                    //send email to member
-                    $pmproemail = new PMProEmail();
-                    $pmproemail->sendCheckoutEmail($user, $invoice);
-
-                    //send email to admin
-                    $pmproemail = new PMProEmail();
-                    $pmproemail->sendCheckoutAdminEmail($user, $invoice);
-
-                    return true;
-                } else {
-                    return false;
+                } catch (Throwable $exception) {
+                    $completed = false;
                 }
+
+                if (!$completed) {
+                    $fresh_order = new MemberOrder($oid);
+                    $fresh_order->getMembershipLevel();
+                    if ($fresh_order->status === 'success' && hash_equals((string) $fresh_order->payment_transaction_id, $track_id)) {
+                        $completed = true;
+                        $morder = $fresh_order;
+                    }
+                }
+
+                if (!$completed) {
+                    zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'review');
+                    zibal_pmpro_cancel_order_for_review($morder, 'پرداخت در زیبال تأیید شد، اما PMPro نتوانست عضویت را تکمیل کند.');
+                    return self::callback_message_outcome('پرداخت تأیید شد، اما تکمیل عضویت با خطا مواجه شد و سفارش باید توسط مدیر بررسی شود.', 500);
+                }
+
+                zibal_pmpro_update_order_meta($morder->id, 'zibal_payment_state', 'completed');
+                $completed_order = new MemberOrder($oid);
+                $completed_order->getMembershipLevel();
+                zibal_pmpro_record_order_report($completed_order, $result, true);
+                return self::callback_redirect_outcome($completed_order);
             }
+
+            private static function callback_redirect_outcome($morder)
+            {
+                return [
+                    'action' => 'redirect',
+                    'url' => pmpro_url("confirmation", "?level=" . absint($morder->membership_level->id)),
+                    'order' => $morder,
+                    'message' => '',
+                    'status' => 200,
+                ];
+            }
+
+            private static function callback_message_outcome($message, $status)
+            {
+                return [
+                    'action' => 'message',
+                    'url' => '',
+                    'order' => null,
+                    'message' => $message,
+                    'status' => absint($status),
+                ];
+            }
+
         }
 
         PMProGateway_Zibal::init();
