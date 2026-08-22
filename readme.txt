@@ -3,8 +3,8 @@ Contributors: zibal
 Tags: zibal, paid memberships pro, payment gateway, membership, iran
 Requires at least: 5.8
 Tested up to: 7.0
-Requires PHP: 7.4
-Stable tag: 1.7
+Requires PHP: 5.6
+Stable tag: 1.8
 License: GPLv2
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -38,7 +38,16 @@ Zibal Paid Memberships Pro درگاه پرداخت زیبال را به افزو
 
 بله. ابتدا محیط پرداخت را روی حالت تست قرار دهید و پس از اطمینان، حالت زنده را فعال کنید.
 
+= آیا روی PHP 5.6 کار می‌کند؟ =
+
+بله، خود درگاه با PHP 5.6 تا PHP 8.5 سازگار است؛ اما نسخه Paid Memberships Pro نیز باید از PHP نصب‌شده پشتیبانی کند. برای نمونه PMPro 2.12.10، 3.0.6 و 3.2.2 روی PHP 5.6 قابل استفاده‌اند، در حالی که PMPro 3.8.4 حداقل PHP 7.4 می‌خواهد.
+
 == Changelog ==
+
+= 1.8 =
+* کاهش حداقل PHP خود درگاه از 7.4 به 5.6.
+* جایگزینی مدیریت خطای مبتنی بر Throwable با مسیر سازگار با PHP 5.6 و PHP 7/8.
+* افزودن تست نسخه‌ای از PHP 5.6 تا PHP 8.5 و مستندسازی محدودیت نسخه PMPro.
 
 = 1.7 =
 * ثبت Note کامل برای پرداخت موفق و ناموفق شامل مبلغ، trackId، refNumber، کارت ماسک‌شده، زمان دقیق و پیام زیبال.

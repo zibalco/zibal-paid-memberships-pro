@@ -3,8 +3,8 @@
  * Plugin Name: Zibal Paid Memberships Pro
  * Description: درگاه پرداخت زیبال برای افزونه Paid Memberships Pro
  * Author: Zibal
- * Version: 1.7
- * Requires PHP: 7.4
+ * Version: 1.8
+ * Requires PHP: 5.6
  * Plugin URI: https://zibal.ir/
  * Author URI: http://github.com/zibalco
  * License: GPL v2.0.
@@ -98,7 +98,7 @@ function zibal_pmpro_user_agent() {
 
     return sprintf(
         'ZibalPaidMembershipsPro/%s WordPress/%s; %s',
-        '1.7',
+        '1.8',
         isset($wp_version) ? $wp_version : 'unknown',
         home_url()
     );
@@ -1259,7 +1259,9 @@ function load_zibal_pmpro_class()
                 try {
                     $morder = new MemberOrder($oid);
                     $morder->getMembershipLevel();
-                } catch (Throwable $exception) {
+                } catch (Exception $exception) {
+                    zibal_pmpro_exit_with_message('شماره سفارش بازگشت پرداخت معتبر نیست.');
+                } catch (Error $error) {
                     zibal_pmpro_exit_with_message('شماره سفارش بازگشت پرداخت معتبر نیست.');
                 }
 
@@ -1398,7 +1400,9 @@ function load_zibal_pmpro_class()
                     } else {
                         $completed = false;
                     }
-                } catch (Throwable $exception) {
+                } catch (Exception $exception) {
+                    $completed = false;
+                } catch (Error $error) {
                     $completed = false;
                 }
 
