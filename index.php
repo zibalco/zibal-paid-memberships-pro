@@ -1214,6 +1214,7 @@ function load_zibal_pmpro_class()
                     $track_id = sanitize_text_field((string) $result->trackId);
                     zibal_pmpro_store_pending_order($morder, $track_id, $amount);
                     $go = 'https://gateway.zibal.ir/start/' . rawurlencode($track_id);
+                    header('Referrer-Policy: origin');
                     wp_redirect(esc_url_raw($go));
                     exit;
 
